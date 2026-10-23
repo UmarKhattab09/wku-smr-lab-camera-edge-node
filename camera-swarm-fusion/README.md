@@ -496,3 +496,50 @@ data/sessions/<aruco_session_YYYYMMDD_HHMMSS>/
 | `--dict` | ArUco dictionary (e.g., `4x4_50`, `4x4_100`, `5x5_50`, …). |
 | `--marker-length-m` | Marker side length in meters (needed for pose & axes). Use `0` to skip pose estimation (IDs only). |
 
+
+## PLC trigger (camera_edge)
+
+`camera_edge` can wait on the robot cell's PLC exactly like the IMU edge
+nodes (`imu_node_smr`, branch `plc_update`). The PLC sends short pulses, and
+only a tag turning ON counts:
+
+| Tag | camera_edge does |
+|---|---|
+| `Data_Start` ON | new session folder, detect, save frames, publish to MQTT |
+| `Db_Stop` ON | end the run, close `detections.csv`, wait for the next `Data_Start` |
+| `IMU_Tare` | ignored (IMU only) |
+
+Unlike the IMU, the `camera_host` session is started once and left running
+between runs, because opening a USB camera takes about a second. Each run
+opens a fresh frame stream and drops any frame captured before the
+`Data_Start` edge. Frames are numbered from 0 per run, matching the IMU
+sample counter. The container health file reports `waiting` between runs, so
+Swarm keeps it healthy.
+
+Turn it on from the Swarm manager:
+
+```bash
+set -a; source ./.env.side; set +a
+export CAMERA_PLC_TRIGGER=true
+docker stack deploy -c swarm-side.yml camera
+docker service logs -f camera_camera-edge   # "waiting for PLC tag Data_Start ..."
+```
+
+| Variable | Default | IMU equivalent |
+|---|---|---|
+| `CAMERA_PLC_TRIGGER` | `false` | `IMU_PLC_TRIGGER` |
+| `CAMERA_PLC_PATH` | `192.168.1.103` | `IMU_PLC_PATH` |
+| `CAMERA_PLC_TAG_START` | `Data_Start` | `IMU_PLC_TAG_START` |
+| `CAMERA_PLC_TAG_STOP` | `Db_Stop` | `IMU_PLC_TAG_STOP` |
+| `CAMERA_PLC_POLL_S` | `0.05` | `IMU_PLC_POLL_S` |
+| `CAMERA_PLC_MAX_RUN_S` | `600` | `IMU_PLC_MAX_RUN_S` |
+| `CAMERA_PLC_FAKE` | `false` | `IMU_PLC_FAKE` |
+| `CAMERA_PLC_FAKE_SPEED` | `1.0` | `IMU_PLC_FAKE_SPEED` |
+
+`CAMERA_PLC_FAKE=true` plays back the lab's recorded pulse pattern (start at
+3 s, stop at 25 s). `python scripts/plc_trigger_smoke.py` runs the whole path
+locally (real camera_host with a fake camera, fake PLC) with no hardware.
+
+Rebuild the edge image on each Pi after pulling, since `pycomm3` was added to
+`requirements-edge.txt`:
+`docker build -f camera_edge/Dockerfile -t camera-edge:latest .`

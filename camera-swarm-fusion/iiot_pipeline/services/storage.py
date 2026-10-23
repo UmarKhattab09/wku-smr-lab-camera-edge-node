@@ -15,6 +15,11 @@ class SessionStorage:
         from time import strftime
         sid = f"{self.name}_{strftime('%Y%m%d_%H%M%S')}"
         self.session_dir = self.root / sid
+        # Back-to-back PLC runs can start within the same second.
+        n = 2
+        while self.session_dir.exists():
+            self.session_dir = self.root / f"{sid}_{n}"
+            n += 1
         self.frames_dir = self.session_dir / "frames"
         self.annotated_dir = self.session_dir / "annotated"   # NEW
         self.logs_dir = self.session_dir / "logs"

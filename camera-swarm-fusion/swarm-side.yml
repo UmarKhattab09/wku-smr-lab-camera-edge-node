@@ -41,6 +41,15 @@ services:
       MQTT_BROKER_PORT: ${MQTT_BROKER_PORT:-1883}
       CLIENT_TYPE: ${CLIENT_TYPE:-CAMERA}
       CAMERA_CSV_PATH: ${CAMERA_CSV_PATH:-/app/data/detections.csv}
+      # PLC trigger, same signals as the IMU nodes (IMU_PLC_* there):
+      # wait for Data_Start, send until Db_Stop, then re-arm.
+      CAMERA_PLC_TRIGGER: ${CAMERA_PLC_TRIGGER:-false}
+      CAMERA_PLC_PATH: ${CAMERA_PLC_PATH:-192.168.1.103}
+      CAMERA_PLC_TAG_START: ${CAMERA_PLC_TAG_START:-Data_Start}
+      CAMERA_PLC_TAG_STOP: ${CAMERA_PLC_TAG_STOP:-Db_Stop}
+      CAMERA_PLC_POLL_S: ${CAMERA_PLC_POLL_S:-0.05}
+      CAMERA_PLC_MAX_RUN_S: ${CAMERA_PLC_MAX_RUN_S:-600}
+      CAMERA_PLC_FAKE: ${CAMERA_PLC_FAKE:-false}
       CAMERA_EDGE_HEALTH_PATH: /tmp/camera-edge-health.json
     healthcheck:
       test: ["CMD", "python3", "-m", "camera_edge", "healthcheck"]
