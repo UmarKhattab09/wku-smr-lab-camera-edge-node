@@ -17,7 +17,8 @@ services:
         condition: any
       placement:
         constraints:
-          - node.labels.camera == true
+          - node.labels.camera == side
+
     volumes:
       - type: bind
         source: /run/camera-hw
