@@ -34,5 +34,11 @@ services:
       CAMERA_PLC_POLL_S: ${CAMERA_PLC_POLL_S:-0.05}
       CAMERA_PLC_MAX_RUN_S: ${CAMERA_PLC_MAX_RUN_S:-600}
       CAMERA_PLC_FAKE: ${CAMERA_PLC_FAKE:-false}
+      # Image processing: local = detect + pose in this container (default);
+      # remote = forward each JPEG to camera-processor (wku-smr-lab-middleware,
+      # camera_processor/) on camera_frames/<DEVICE_ID>_<CAMERA_NAME>/frame.
+      CAMERA_PROCESSING: ${CAMERA_PROCESSING:-local}
+      CAMERA_FRAME_BROKER_IP: ${CAMERA_FRAME_BROKER_IP:-}
+      CAMERA_FRAME_TOPIC_PREFIX: ${CAMERA_FRAME_TOPIC_PREFIX:-camera_frames}
     restart: unless-stopped
     command: ["python3", "-m", "camera_edge"]

@@ -33,6 +33,13 @@ def _parse_marker_lengths(raw: str | None) -> dict[int, float] | None:
     return lengths or None
 
 
+def _parse_processing(raw: str | None) -> str:
+    value = (raw or "local").strip().lower()
+    if value not in {"local", "remote"}:
+        raise ValueError(f"CAMERA_PROCESSING must be 'local' or 'remote', not {raw!r}")
+    return value
+
+
 @dataclass
 class EdgeAgentConfig:
     socket_path: str
@@ -70,6 +77,18 @@ class EdgeAgentConfig:
     plc_fake: bool = False
     plc_fake_speed: float = 1.0
     plc_max_run_s: float = 600.0
+    # Where the image processing runs. "local": detect + pose here, as before.
+    # "remote": forward each JPEG to camera-processor (middleware repo) over
+    # MQTT and let it detect; see frame_forwarder.py.
+    processing: str = "local"
+    frame_broker_ip: str = ""
+    frame_broker_port: int = 1883
+    frame_topic_prefix: str = "camera_frames"
+    frame_qos: int = 0
+
+    @property
+    def remote_processing(self) -> bool:
+        return self.processing == "remote"
 
     @classmethod
     def from_env(cls) -> "EdgeAgentConfig":
@@ -111,4 +130,10 @@ class EdgeAgentConfig:
             plc_fake=_env_flag("CAMERA_PLC_FAKE", False),
             plc_fake_speed=float(os.getenv("CAMERA_PLC_FAKE_SPEED", "1.0")),
             plc_max_run_s=float(os.getenv("CAMERA_PLC_MAX_RUN_S", "600")),
+            processing=_parse_processing(os.getenv("CAMERA_PROCESSING", "local")),
+            # Blank = the broker the rows used to go to (MQTT_BROKER_IP).
+            frame_broker_ip=os.getenv("CAMERA_FRAME_BROKER_IP") or os.getenv("MQTT_BROKER_IP", "127.0.0.1"),
+            frame_broker_port=int(os.getenv("CAMERA_FRAME_BROKER_PORT") or os.getenv("MQTT_BROKER_PORT", "1883")),
+            frame_topic_prefix=os.getenv("CAMERA_FRAME_TOPIC_PREFIX", "camera_frames"),
+            frame_qos=min(1, max(0, int(os.getenv("CAMERA_FRAME_QOS", "0")))),
         )

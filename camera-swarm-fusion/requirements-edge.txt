@@ -2,3 +2,5 @@ facade-sdk==0.4.3
 opencv-contrib-python-headless
 numpy
 pycomm3
+# frame_forwarder.py (CAMERA_PROCESSING=remote); also pulled in by facade-sdk
+paho-mqtt>=1.6.1

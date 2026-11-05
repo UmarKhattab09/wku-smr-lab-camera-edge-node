@@ -100,6 +100,40 @@ In this repo, that behavior is implemented by:
 - host service: `camera_host/`
 - edge container agent: `camera_edge/`
 
+## Remote Processing (CAMERA_PROCESSING=remote)
+
+The image processing can move off the Pi entirely:
+
+```
+CAM_PI (camera_host takes the photo, camera_edge forwards it)
+    -> camera-processor (wku-smr-lab-middleware, camera_processor/, on the AMS)
+    -> AMS (camera/<DEVICE_ID>_<CAMERA_NAME>, ingested by fastapi-app)
+```
+
+With `CAMERA_PROCESSING=remote`, `camera_edge` still talks to `camera_host`,
+waits for the PLC and numbers each run's frames, but it no longer decodes
+frames or runs detection. Each JPEG is published unchanged on
+`camera_frames/<DEVICE_ID>_<CAMERA_NAME>/frame` (`camera_edge/frame_forwarder.py`),
+with a retained `.../config` message carrying the calibration and detection
+settings. camera-processor runs the same ArUco + PnP code and publishes the
+same rows on `camera/<DEVICE_ID>_<CAMERA_NAME>`, so the middleware's ingestion
+is unchanged. Run folders (frames, annotated frames, detections.csv) are kept
+by camera-processor instead of under `/app/data/sessions` on the Pi.
+
+| Variable | Default | |
+| --- | --- | --- |
+| `CAMERA_PROCESSING` | `local` | `local` or `remote` |
+| `CAMERA_FRAME_BROKER_IP` / `_PORT` | `MQTT_BROKER_IP` / `_PORT` | broker the frames go to |
+| `CAMERA_FRAME_TOPIC_PREFIX` | `camera_frames` | must match camera-processor; never `camera` |
+| `CAMERA_FRAME_QOS` | `0` | frames are dropped (and counted) while the broker is down |
+
+End-to-end check against a running camera-processor (it also confirms the
+remote rows equal what local processing computes from the same JPEG):
+
+```bash
+python scripts/remote_processing_smoke.py <broker-ip> 1883
+```
+
 ## Local API Contract
 
 The Pi-local service exposes these endpoints:

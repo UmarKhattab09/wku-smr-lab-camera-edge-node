@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from camera_fusion.detect import build_detector, detect_markers
-from camera_fusion.output import CsvOutput, MqttOutput
+from camera_fusion.output import CsvOutput, MqttOutput, NullOutput
 from iiot_pipeline.services.calib import load_calib
 from iiot_pipeline.services.storage import SessionStorage
 from iiot_pipeline.strategies.localize_pnp import PnPLocalize
@@ -21,6 +21,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger("camera_edge")
+from .frame_forwarder import FrameForwarder, build_config_message
 from .health import EdgeHealthTracker
 from .plc_signals import PLCSignalWatcher, build_plc_factory
 from .service_client import LocalCameraServiceClient, ServiceError
@@ -36,6 +37,11 @@ class EdgeAgent:
     publishes through the existing CsvOutput/MqttOutput sinks so the
     detections.csv schema and MQTT payload/topic stay exactly what the
     middleware already expects.
+
+    With CAMERA_PROCESSING=remote it does none of the image processing: each
+    JPEG from camera_host is forwarded unchanged to camera-processor on the
+    AMS (frame_forwarder.py), which detects and publishes the same rows. The
+    PLC gating, run boundaries and frame numbering below stay on the Pi.
     """
 
     def __init__(self, config: EdgeAgentConfig, plc_factory=None):
@@ -45,7 +51,10 @@ class EdgeAgent:
         self.health = EdgeHealthTracker(config.health_path)
         self._stop_requested = False
 
-        K, dist, _ = load_calib(config.calibration_path)
+        K, dist, image_size = load_calib(config.calibration_path)
+        self._calib = (K, dist, image_size)
+        self._forwarder: FrameForwarder | None = None
+        self._run_id = config.session_id
         self._localize = PnPLocalize(K, dist, config.marker_length_m)
         self._detector_state = build_detector(config.aruco_dict)
         self._target_ids = set(config.target_ids) if config.target_ids else None
@@ -66,14 +75,34 @@ class EdgeAgent:
             self.config.calibration_path,
         )
 
-        csv_output = CsvOutput()
-        mqtt_output = MqttOutput(
-            broker_ip=self.config.mqtt_broker_ip,
-            broker_port=self.config.mqtt_broker_port,
-            device_id=self.config.device_id,
-            client_type=self.config.client_type,
-            camera_name=self.config.camera_name,
-        )
+        if self.config.remote_processing:
+            self._forwarder = FrameForwarder(
+                broker_ip=self.config.frame_broker_ip,
+                broker_port=self.config.frame_broker_port,
+                topic_prefix=self.config.frame_topic_prefix,
+                config_message=build_config_message(self.config, *self._calib),
+                qos=self.config.frame_qos,
+            )
+            self._forwarder.open()
+            # Rows are published by camera-processor, not from here.
+            csv_output, mqtt_output = NullOutput(), NullOutput()
+        else:
+            csv_output = CsvOutput()
+            mqtt_output = MqttOutput(
+                broker_ip=self.config.mqtt_broker_ip,
+                broker_port=self.config.mqtt_broker_port,
+                device_id=self.config.device_id,
+                client_type=self.config.client_type,
+                camera_name=self.config.camera_name,
+            )
+
+        try:
+            self._run_with_outputs(csv_output, mqtt_output)
+        finally:
+            if self._forwarder is not None:
+                self._forwarder.close()
+
+    def _run_with_outputs(self, csv_output, mqtt_output) -> None:
 
         if self.config.plc_trigger:
             # One MQTT connection for the container's lifetime, like imu_edge's
@@ -90,7 +119,11 @@ class EdgeAgent:
                         pass
             return
 
-        session_dir = self._open_session_storage()
+        if self._forwarder is not None:
+            session_dir = Path(self.config.session_root)  # unused by the null outputs
+            self._run_id = self.config.session_id
+        else:
+            session_dir = self._open_session_storage()
 
         csv_output.open(session_dir)
         mqtt_output.open(session_dir)
@@ -230,9 +263,15 @@ class EdgeAgent:
         dropped = 0
         end_reason = "camera_host stopped sending frames"
 
-        csv_output = CsvOutput()
-        session_dir = self._open_session_storage()
-        csv_output.open(session_dir)
+        if self._forwarder is not None:
+            # camera-processor opens a run folder per run_id.
+            csv_output = NullOutput()
+            self._run_id = f"{self.config.session_id}-{start_ms}"
+            session_dir = f"run {self._run_id} (frames forwarded to camera-processor)"
+        else:
+            csv_output = CsvOutput()
+            session_dir = self._open_session_storage()
+            csv_output.open(session_dir)
         logger.info(
             "PLC: %s ON -> detecting and sending   [%s]",
             self.config.plc_tag_start, watcher.snapshot(),
@@ -347,7 +386,33 @@ class EdgeAgent:
                 self._process_frame(sample, csv_output, mqtt_output)
             time.sleep(self.config.poll_interval_s)
 
+    def _forward_frame(self, sample: dict) -> None:
+        forwarder = self._forwarder
+        sent = forwarder.send(sample, self._run_id)
+        self.health.update(
+            state="streaming",
+            session_id=self.config.session_id,
+            processing="remote",
+            run_id=self._run_id,
+            frame_broker_connected=forwarder.connected,
+            forwarded=forwarder.sent,
+            dropped=forwarder.dropped,
+            error_message=forwarder.last_error,
+            last_capture_time_ms=sample["capture_time_ms"],
+            last_frame_idx=sample["frame_idx"],
+        )
+        # Every 50th frame, and every 50th drop (not 15 lines a second while the broker is down)
+        if sample["frame_idx"] % 50 == 0 or (not sent and forwarder.dropped % 50 == 1):
+            logger.info(
+                "frame=%s %s (forwarded %d, dropped %d)",
+                sample["frame_idx"], "forwarded" if sent else "DROPPED: frame broker not connected",
+                forwarder.sent, forwarder.dropped,
+            )
+
     def _process_frame(self, sample: dict, csv_output: CsvOutput, mqtt_output: MqttOutput) -> None:
+        if self._forwarder is not None:
+            return self._forward_frame(sample)
+
         image = cv2.imdecode(np.frombuffer(sample["jpeg"], dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             return
