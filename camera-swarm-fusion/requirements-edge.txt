@@ -1,3 +1,4 @@
 facade-sdk==0.4.3
 opencv-contrib-python-headless
 numpy
+pycomm3

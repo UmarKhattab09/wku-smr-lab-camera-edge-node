@@ -61,6 +61,15 @@ class EdgeAgentConfig:
     save_frames: bool
     save_annotated: bool
     session_root: str
+    # PLC trigger -- same signals and defaults as imu_edge (IMU_PLC_*).
+    plc_trigger: bool = False
+    plc_path: str = "192.168.1.103"
+    plc_tag_start: str = "Data_Start"
+    plc_tag_stop: str = "Db_Stop"
+    plc_poll_s: float = 0.05
+    plc_fake: bool = False
+    plc_fake_speed: float = 1.0
+    plc_max_run_s: float = 600.0
 
     @classmethod
     def from_env(cls) -> "EdgeAgentConfig":
@@ -94,4 +103,12 @@ class EdgeAgentConfig:
             save_frames=_env_flag("CAMERA_SAVE_FRAMES", True),
             save_annotated=_env_flag("CAMERA_SAVE_ANNOTATED", True),
             session_root=os.getenv("CAMERA_SESSION_ROOT", "/app/data/sessions"),
+            plc_trigger=_env_flag("CAMERA_PLC_TRIGGER", False),
+            plc_path=os.getenv("CAMERA_PLC_PATH", "192.168.1.103"),
+            plc_tag_start=os.getenv("CAMERA_PLC_TAG_START", "Data_Start"),
+            plc_tag_stop=os.getenv("CAMERA_PLC_TAG_STOP", "Db_Stop"),
+            plc_poll_s=max(0.01, float(os.getenv("CAMERA_PLC_POLL_S", "0.05"))),
+            plc_fake=_env_flag("CAMERA_PLC_FAKE", False),
+            plc_fake_speed=float(os.getenv("CAMERA_PLC_FAKE_SPEED", "1.0")),
+            plc_max_run_s=float(os.getenv("CAMERA_PLC_MAX_RUN_S", "600")),
         )

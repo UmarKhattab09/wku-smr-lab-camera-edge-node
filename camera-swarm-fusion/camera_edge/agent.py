@@ -22,6 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("camera_edge")
 from .health import EdgeHealthTracker
+from .plc_signals import PLCSignalWatcher, build_plc_factory
 from .service_client import LocalCameraServiceClient, ServiceError
 
 
@@ -37,8 +38,9 @@ class EdgeAgent:
     middleware already expects.
     """
 
-    def __init__(self, config: EdgeAgentConfig):
+    def __init__(self, config: EdgeAgentConfig, plc_factory=None):
         self.config = config
+        self._plc_factory = plc_factory  # override the PLC connection (tests)
         self.client = LocalCameraServiceClient(config.socket_path)
         self.health = EdgeHealthTracker(config.health_path)
         self._stop_requested = False
@@ -73,23 +75,22 @@ class EdgeAgent:
             camera_name=self.config.camera_name,
         )
 
-        storage = SessionStorage(self.config.session_root, name=f"{self.config.camera_name}_session")
-        session_dir = Path(storage.begin())
-        self._frames_dir = storage.frames_dir
-        self._storage = storage
-        logger.info("session directory: %s", session_dir)
+        if self.config.plc_trigger:
+            # One MQTT connection for the container's lifetime, like imu_edge's
+            # writer; a new session folder + detections.csv per PLC run.
+            mqtt_output.open(Path(self.config.session_root))
+            try:
+                self._run_plc_triggered(mqtt_output)
+            finally:
+                mqtt_output.close()
+                if self.config.stop_session_on_exit:
+                    try:
+                        self.client.stop_session()
+                    except (ServiceError, OSError):
+                        pass
+            return
 
-        storage.write_manifest({
-            "camera_name": self.config.camera_name,
-            "device_id": self.config.device_id,
-            "calibration_path": self.config.calibration_path,
-            "marker_length_m": self.config.marker_length_m,
-            "aruco_dict": self.config.aruco_dict,
-            "fps": self.config.fps,
-            "width": self.config.width,
-            "height": self.config.height,
-            "session_id": self.config.session_id,
-        })
+        session_dir = self._open_session_storage()
 
         csv_output.open(session_dir)
         mqtt_output.open(session_dir)
@@ -123,6 +124,178 @@ class EdgeAgent:
             except ServiceError:
                 pass
 
+    def _open_session_storage(self) -> Path:
+        storage = SessionStorage(self.config.session_root, name=f"{self.config.camera_name}_session")
+        session_dir = Path(storage.begin())
+        self._frames_dir = storage.frames_dir
+        self._storage = storage
+        logger.info("session directory: %s", session_dir)
+
+        storage.write_manifest({
+            "camera_name": self.config.camera_name,
+            "device_id": self.config.device_id,
+            "calibration_path": self.config.calibration_path,
+            "marker_length_m": self.config.marker_length_m,
+            "aruco_dict": self.config.aruco_dict,
+            "fps": self.config.fps,
+            "width": self.config.width,
+            "height": self.config.height,
+            "session_id": self.config.session_id,
+            "plc_trigger": self.config.plc_trigger,
+        })
+        return session_dir
+
+    # ------------------------------------------------------------------
+    # PLC trigger -- mirrors imu_edge.agent._run_plc_triggered. The PLC
+    # sends short pulses, so only a tag turning ON matters:
+    #
+    #     Data_Start turns ON  -> start: detect, save and send frames
+    #     Db_Stop turns ON     -> stop sending, wait for the next Data_Start
+    #
+    # One difference from the IMU: the camera_host session is started once
+    # and left running between runs, because opening a USB camera takes
+    # about a second and would cut off the start of every run. Instead each
+    # run opens a fresh /v1/frame/stream (a new, empty queue on the host)
+    # and drops any frame captured before the Data_Start edge.
+    # ------------------------------------------------------------------
+
+    def _run_plc_triggered(self, mqtt_output: MqttOutput) -> None:
+        watcher = PLCSignalWatcher(
+            self._plc_factory
+            or build_plc_factory(
+                self.config.plc_path,
+                fake=self.config.plc_fake,
+                fake_speed=self.config.plc_fake_speed,
+            ),
+            tag_start=self.config.plc_tag_start,
+            tag_stop=self.config.plc_tag_stop,
+            poll_s=self.config.plc_poll_s,
+        )
+        watcher.start()
+        logger.info(
+            "PLC trigger on: PLC %s, start on %s, stop on %s",
+            self.config.plc_path, self.config.plc_tag_start, self.config.plc_tag_stop,
+        )
+
+        try:
+            while not self._stop_requested:
+                try:
+                    self._wait_until_ready()
+                    # Keep the camera warm between runs (no-op if already active).
+                    self._start_session(quiet=True)
+                    if not self._wait_for_plc_start(watcher):
+                        break
+                    self._capture_one_run(watcher, mqtt_output)
+                except ServiceError as error:
+                    logger.warning("service error: %s %s", error.code, error.message)
+                    self.health.update(state="degraded", error_code=error.code, error_message=error.message)
+                    time.sleep(self.config.reconnect_delay_s)
+                except Exception as error:
+                    logger.exception("unexpected failure in PLC-triggered loop")
+                    self.health.update(state="degraded", error_code="EDGE_FAILURE", error_message=str(error))
+                    time.sleep(self.config.reconnect_delay_s)
+        finally:
+            watcher.close()
+
+    def _wait_for_plc_start(self, watcher: PLCSignalWatcher) -> bool:
+        """Block until Data_Start turns ON. False if the agent is shutting down."""
+        starts_seen = watcher.start_count
+        last_health = 0.0
+        while not self._stop_requested:
+            if watcher.start_count > starts_seen:
+                return True
+
+            # Keep the health file fresh so the container stays healthy
+            # however long the robot takes to start.
+            if time.monotonic() - last_health > 5.0:
+                detail = f"waiting for PLC tag {self.config.plc_tag_start}"
+                if not watcher.connected:
+                    detail = f"cannot reach PLC at {self.config.plc_path}: {watcher.last_error}"
+                elif watcher.last_error:
+                    detail = f"PLC tag problem: {watcher.last_error}"
+                self.health.update(state="waiting", detail=detail)
+                logger.info("%s   [%s]", detail, watcher.snapshot())
+                last_health = time.monotonic()
+
+            time.sleep(self.config.plc_poll_s)
+        return False
+
+    def _capture_one_run(self, watcher: PLCSignalWatcher, mqtt_output: MqttOutput) -> None:
+        stops_seen = watcher.stop_count
+        start_ms = int(time.time() * 1000)
+        run_started = time.monotonic()
+        max_run_s = self.config.plc_max_run_s
+        first_frame_idx: int | None = None
+        sent = 0
+        dropped = 0
+        end_reason = "camera_host stopped sending frames"
+
+        csv_output = CsvOutput()
+        session_dir = self._open_session_storage()
+        csv_output.open(session_dir)
+        logger.info(
+            "PLC: %s ON -> detecting and sending   [%s]",
+            self.config.plc_tag_start, watcher.snapshot(),
+        )
+
+        samples = self._samples()
+        try:
+            for sample in samples:
+                if self._stop_requested:
+                    end_reason = "the agent was stopped"
+                    break
+                if watcher.stop_count > stops_seen:
+                    end_reason = f"{self.config.plc_tag_stop} turned ON"
+                    break
+                if max_run_s > 0 and time.monotonic() - run_started > max_run_s:
+                    end_reason = (
+                        f"no {self.config.plc_tag_stop} signal within "
+                        f"{max_run_s:g} s (CAMERA_PLC_MAX_RUN_S)"
+                    )
+                    break
+
+                # Frames captured before the Data_Start edge don't belong to the run.
+                if sample["capture_time_ms"] < start_ms:
+                    dropped += 1
+                    continue
+
+                # Number the frames of each run from 0, like the IMU samples.
+                if first_frame_idx is None:
+                    first_frame_idx = sample["frame_idx"]
+                sample["frame_idx"] -= first_frame_idx
+                self._process_frame(sample, csv_output, mqtt_output)
+                sent += 1
+        except Exception as error:
+            end_reason = f"error: {type(error).__name__}: {error}"
+            raise
+        finally:
+            samples.close()  # closes the host stream
+            csv_output.close()
+            logger.info(
+                "PLC: run ended (%d frames sent, %d pre-start frames dropped); reason: %s; session %s",
+                sent, dropped, end_reason, session_dir,
+            )
+            self.health.update(state="waiting", detail="run ended; re-armed")
+
+    def _samples(self):
+        """Frames from camera_host, from a fresh stream or by polling."""
+        if self.config.use_frame_stream:
+            with self.client.stream() as stream:
+                yield from stream
+            return
+
+        last_frame_idx = None
+        while True:
+            frame = self.client.frame_latest()
+            if frame["frame_idx"] != last_frame_idx:
+                last_frame_idx = frame["frame_idx"]
+                yield {
+                    "jpeg": frame["jpeg"],
+                    "frame_idx": frame["frame_idx"],
+                    "capture_time_ms": frame["capture_time_ms"],
+                }
+            time.sleep(self.config.poll_interval_s)
+
     def _wait_until_ready(self) -> None:
         while not self._stop_requested:
             try:
@@ -141,7 +314,7 @@ class EdgeAgent:
 
             time.sleep(self.config.reconnect_delay_s)
 
-    def _start_session(self) -> None:
+    def _start_session(self, quiet: bool = False) -> None:
         try:
             self.client.start_session(
                 self.config.session_id, self.config.fps, self.config.width, self.config.height
@@ -150,7 +323,8 @@ class EdgeAgent:
         except ServiceError as error:
             if error.code != "SESSION_ALREADY_ACTIVE":
                 raise
-            logger.info("session already active: %s", self.config.session_id)
+            if not quiet:
+                logger.info("session already active: %s", self.config.session_id)
 
     def _consume_stream(self, csv_output: CsvOutput, mqtt_output: MqttOutput) -> None:
         with self.client.stream() as stream:
